@@ -26,6 +26,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
                  add_kmeans_features=True,
                  feature_selection=True, # opcje to True, False
                  add_poly_features=True, 
+                 binnarise_features=True, # dodaje kolumny z binningiem (KBinsDiscretizer)
                  remove_outliers=False, # bardzo zle przy niezbalansowanych, lepiej False
                  remove_multicollinearity=True, # istotne do selekcji cech
                  multicollinearity_threshold=0.95,
@@ -119,6 +120,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         self.freq_cols = []    # Lista kolumn, które kodujemy
 
         #-- Nowe pola dla Binning ---
+        self.binnarise_features = binnarise_features # Czy dodawać cechy z binningiem
         self.binning_transformer = None
         self.binning_cols = []       # Kolumny źródłowe
         self.binning_new_names = []  # Nazwy nowych kolumn BIN_...
@@ -133,6 +135,9 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         self.add_poly_features = add_poly_features
         self.cols_to_poly = [] # Lista kolumn do interakcji
         self.added_poly_cols = [] # Nazwy nowych cech z interakcji
+        ## opcjonalnie ponowne uruchomienie
+        self.second_cols_to_poly = []
+        self.second_added_poly_cols = []
 
         # Target processing
         self.imputer_y = SimpleImputer(strategy='most_frequent')
@@ -402,13 +407,9 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
 
     def _fit_binning_features(self, X):
         """Uczy się przedziałów (kwantyli) na zbiorze treningowym."""
-        # Logika wyboru kolumn (np. te same co do interakcji lub top numeryczne)
-        if self.cols_to_poly:
-            self.binning_cols = [c for c in self.cols_to_poly if c in X.columns]
-        else:
-            # Fallback: pierwsze 10 numerycznych
-            self.binning_cols = [c for c in self.num_cols if c in X.columns][:10]
-            
+        # Logika wyboru kolumn: numeryczne
+        self.binning_cols = [c for c in self.num_cols if c in X.columns]
+        
         if not self.binning_cols:
             return
 
@@ -506,7 +507,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         
         # Limit cech bazowych, z których robimy kombinacje.
         # Jeśli dasz 5, to par będzie 5 po 2 = 10 par. Każda para ma 4 operacje (+,-,*,/) = 40 nowych cech.
-        NUM_OF_FEATURES_LIMIT = 6
+        NUM_OF_FEATURES_LIMIT = 7
 
         # Bierzemy tylko numeryczne, żeby nie mnożyć kategorii
         valid_cols = [c for c in self.num_cols if c in X.columns]
@@ -619,6 +620,130 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         
         return X
 
+    def _add_poly_features_again(self, X, y):
+        """
+        Generuje zaawansowane cechy inżynierskie:
+        1. Unarne: log(x), x^2
+        2. Binarne (pary najważniejszych cech): A+B, A-B, A*B, A/B
+        """
+        if not self.add_poly_features:
+            return X
+        
+        # Limit cech bazowych, z których robimy kombinacje.
+        # Jeśli dasz 5, to par będzie 5 po 2 = 10 par. Każda para ma 4 operacje (+,-,*,/) = 40 nowych cech.
+        NUM_OF_FEATURES_LIMIT = 3
+
+        # Bierzemy tylko numeryczne, żeby nie mnożyć kategorii
+        valid_cols = [c for c in self.num_cols if c in X.columns]
+        
+        if not valid_cols:
+            return X
+
+        if len(valid_cols) > NUM_OF_FEATURES_LIMIT:
+            if y is not None:
+                print(f"   -> Wybieranie top {NUM_OF_FEATURES_LIMIT} cech do interakcji (ExtraTrees)...")
+                try:
+                    # Lekki model do szybkiego rankingu
+                    et = ExtraTreesClassifier(
+                        n_estimators=50, 
+                        max_depth=5,     # Płytkie drzewa wystarczą do oceny ważności
+                        n_jobs=-1, 
+                        random_state=self.random_state,
+                        class_weight='balanced'
+                    )
+                    et.fit(X[valid_cols], y)
+                    
+                    # Pobieramy ważności i sortujemy
+                    importances = et.feature_importances_
+                    indices = np.argsort(importances)[::-1] # Indeksy malejąco
+                    top_indices = indices[:NUM_OF_FEATURES_LIMIT]
+                    
+                    self.second_cols_to_poly = [valid_cols[i] for i in top_indices]
+                    print(f"   Wybrane kolumny do powtórnej interakcji: {self.second_cols_to_poly}")
+                except Exception as e:
+                    print(f"   Błąd selekcji do powtórnej interakcji ({e}). Biorę pierwsze {NUM_OF_FEATURES_LIMIT}.")
+                    self.second_cols_to_poly = valid_cols[:NUM_OF_FEATURES_LIMIT]
+            else:
+                # Fallback jeśli brak y
+                self.second_cols_to_poly = valid_cols[:NUM_OF_FEATURES_LIMIT]
+        else:
+            # Jeśli mało kolumn, bierzemy wszystkie
+            self.second_cols_to_poly = valid_cols
+            
+        # --- GENEROWANIE CECH ---
+        # Tutaj wywołujemy logikę transformacji od razu, żeby zaktualizować X
+        # Nie potrzebujemy 'fit' dla matematyki (dodawanie to dodawanie), 
+        # musimy tylko pamiętać 'second_cols_to_poly' (co zrobiliśmy wyżej).
+        
+        return self._transform_poly_features_again(X)
+
+
+    def _transform_poly_features_again(self, X):
+        """Aplikuje operacje matematyczne na wybranych kolumnach."""
+        if not self.add_poly_features or not hasattr(self, 'second_cols_to_poly') or not self.second_cols_to_poly:
+            return X
+        
+        # Sprawdzamy czy wybrane kolumny są w X
+        valid_cols = [c for c in self.second_cols_to_poly if c in X.columns]
+        if len(valid_cols) < 1:
+            return X
+        
+        new_features = {}
+        epsilon = 1e-6 # Zabezpieczenie przed dzieleniem przez zero
+        
+        # A. Transformacje UNARNE (pojedyncze kolumny)
+        for col in valid_cols:
+            # 1. Logarytm (bezpieczny: log(abs(x) + 1))
+            # Obsługuje ujemne wartości zamieniając je na log z modułu
+            new_features[f'LOG_{col}'] = np.log1p(np.abs(X[col]))
+            
+            # 2. Kwadrat (zastępuje PolynomialFeatures degree=2 dla samego siebie)
+            new_features[f'SQR_{col}'] = X[col] ** 2
+            
+            # Opcjonalnie: Pierwiastek (tylko z modułu)
+            # new_features[f'SQRT_{col}'] = np.sqrt(np.abs(X[col]))
+
+        # B. Transformacje BINARNE (pary kolumn)
+        import itertools
+        # Tworzymy pary z wybranych kolumn (np. V1 i V4)
+        for col_a, col_b in itertools.combinations(valid_cols, 2):
+            val_a = X[col_a]
+            val_b = X[col_b]
+            
+            # 3. Mnożenie (Interakcja)
+            new_features[f'MUL_{col_a}_x_{col_b}'] = val_a * val_b
+            
+            # 4. A / B
+            # Logika: Jeśli val_b == 0, użyj epsilon. W przeciwnym razie użyj val_b.
+            # Nie dodajemy epsilona do liczb, które nie są zerem, żeby nie zniekształcać danych.
+            denom_b = np.where(val_b == 0, epsilon, val_b)
+            new_features[f'DIV_{col_a}_by_{col_b}'] = val_a / denom_b
+            
+            # W drugą stronę: B / A
+            denom_a = np.where(val_a == 0, epsilon, val_a)
+            new_features[f'DIV_{col_b}_by_{col_a}'] = val_b / denom_a
+            
+            # 5. Różnica (Difference)
+            new_features[f'SUB_{col_a}_{col_b}'] = val_a - val_b
+            
+            # 6. Suma (często mniej ważna dla drzew, ale może się przydać)
+            new_features[f'ADD_{col_a}_{col_b}'] = val_a + val_b
+
+        # Tworzenie DataFrame z nowych cech
+        X_new_feats = pd.DataFrame(new_features, index=X.index)
+        
+        # Filtrowanie duplikatów (jeśli już są w X - rzadkie, ale możliwe)
+        self.second_added_poly_cols = [c for c in X_new_feats.columns if c not in X.columns]
+        
+        if self.second_added_poly_cols:
+            X = pd.concat([X, X_new_feats[self.second_added_poly_cols]], axis=1)
+            # Aktualizacja listy numerycznych (tylko w fit, ale tu robimy trick sprawdzając typ)
+            # Jeśli wywołujemy to z transform(), to self.num_cols nie powinno się zmieniać trwale 
+            # w sposób, który zepsułby pipeline, ale dla spójności warto wiedzieć, że to liczby.
+            # (W metodzie fit() w klasie głównej i tak nadpisujesz num_cols na końcu, więc jest OK).
+        
+        return X
+
     def _remove_collinear(self, X):
         """Usuwa kolumny silnie skorelowane ze sobą."""
         if not self.remove_multicollinearity:
@@ -701,17 +826,16 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
 
         if self.cols_to_drop_early:
             print(f"--- Wstępne czyszczenie: Usunięto {len(self.cols_to_drop_early)} kolumn (stałe lub ID) ---")
-            # print(f"-> Usunięte: {self.cols_to_drop_early}")
 
     def _fit_feature_selection(self, X, y):
         """
         Inteligentna selekcja cech:
-        1. ENSEMBLE SCREENING (L2 + ExtraTrees):
+        1. ENSEMBLE SCREENING (L1 + ExtraTrees):
         - Usuwa zmienne, które są słabe ZARÓWNO liniowo, jak i nieliniowo.
         - To jest 'miękkie' wstępne czyszczenie.
         2. HYBRYDOWA REDUKCJA:
-        - Jeśli cech zostało mało (<60) -> SFS Backward (Maksymalna precyzja).
-        - Jeśli cech zostało dużo (>60) -> PCA (Kompresja informacji).
+        - Jeśli cech zostało mało -> SFS Backward (Maksymalna precyzja).
+        - Jeśli cech zostało dużo -> PCA (Kompresja informacji).
         """
         if not self.feature_selection:
             self.selection_mode = None
@@ -723,7 +847,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         n_start = len(initial_cols)
         
         # Próg przełączenia między SFS a PCA
-        SFS_CAP_THRESHOLD = 100
+        SFS_CAP_THRESHOLD = 250
 
         # ==========================================
         # ETAP 1: ENSEMBLE SCREENING (L1 + ExtraTrees)
@@ -991,16 +1115,21 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         if self.add_poly_features:
             X = self._add_poly_features(X, y_proc)
             self.num_cols.extend(self.added_poly_cols)
+            X = self._add_poly_features_again(X, y_proc)
+            self.num_cols.extend(self.second_added_poly_cols)
                     
 
         # D. Binning (Uczymy się przedziałów i transformujemy X)
-        self._fit_binning_features(X)
-        X = self._transform_binning_features(X)
-        # Aktualizacja listy numerycznej o nowe kolumny BIN_
-        # (Dla modeli drzewiastych traktujemy je jako numeryczne/ordinal)
-        if self.binning_new_names:
-            self.cat_cols.extend(self.binning_new_names)
-
+        if self.binnarise_features:
+            self._fit_binning_features(X)
+            X = self._transform_binning_features(X)
+            # Aktualizacja listy numerycznej o nowe kolumny BIN_
+            if self.binning_new_names:
+                self.cat_cols.extend(self.binning_new_names)
+        else:
+            self.binning_new_names = []
+            self.binning_cols = []
+        
         # --- 3. Czyszczenie (Współliniowość) ---
         # Robimy to PO wygenerowaniu wszystkiego, żeby usunąć np. interakcje skorelowane z oryginałem
         if self.remove_multicollinearity:
@@ -1022,7 +1151,6 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         y_transformed = self._process_target(y, fit=False)
         
         if self.cols_to_drop_early:
-            # errors='ignore' na wypadek gdyby w X (np. testowym) tych kolumn w ogóle nie było
             X = X.drop(columns=self.cols_to_drop_early, errors='ignore')
 
         X = self._process_dates_cyclical(X)
@@ -1048,8 +1176,10 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
 
         if self.add_poly_features:
             X = self._transform_poly_features(X)
-
-        X = self._transform_binning_features(X)
+            X = self._transform_poly_features_again(X)
+        
+        if self.binnarise_features:
+            X = self._transform_binning_features(X)
 
         # --- Czyszczenie (Współliniowość) ---
         if self.remove_multicollinearity and self.collinear_drop_cols:
